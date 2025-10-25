@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { useParams } from "react-router-dom";
 import { supabase } from "@/lib/supabaseClient";
 import { useMe } from "@/hooks/useMe";
@@ -219,7 +219,7 @@ export default function Game() {
   }
 
   function toggleCard(code: string) {
-    const up = code.toUpperCase();
+    const up = (code || "").toUpperCase();
     setSelected((prev) => (prev.includes(up) ? prev.filter((c) => c !== up) : [...prev, up]));
   }
 
@@ -301,7 +301,7 @@ export default function Game() {
       {/* My hand */}
       <div className="mb-4 flex flex-wrap justify-center gap-2">
         {myCards.map((code) => {
-          const up = code.toUpperCase();
+          const up = (code || "").toUpperCase();
           const selectedCls = selected.includes(up) ? "-translate-y-4 ring-4 ring-primary" : "hover:-translate-y-2";
           return (
             <img
