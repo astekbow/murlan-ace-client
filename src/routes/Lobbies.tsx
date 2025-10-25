@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { useNavigate } from "react-router-dom";
 import { supabase } from "@/lib/supabaseClient";
 import { useMe } from "@/hooks/useMe";
@@ -9,101 +9,127 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { toast } from "@/hooks/use-toast";
 
-type Lobby = {
+type LobbyRow = {
   id: string;
   code: string;
-  mode: string;
+  mode: "1v1" | "ffa3" | "2v2";
   stake_amount: number;
   status: string;
   max_players: number;
   host_id: string;
   season_id: string | null;
+};
+
+type LobbyUI = LobbyRow & {
   players: { user_id: string; username: string }[];
 };
 
-type Season = {
-  id: string;
-  name: string;
-};
+type Season = { id: string; name: string };
 
 export default function Lobbies() {
   const { user } = useMe();
   const navigate = useNavigate();
 
-  const [lobbies, setLobbies] = useState<Lobby[]>([]);
+  const [lobbies, setLobbies] = useState<LobbyUI[]>([]);
   const [seasons, setSeasons] = useState<Season[]>([]);
   const [joinCode, setJoinCode] = useState("");
 
   // Create lobby form
   const [mode, setMode] = useState<"1v1" | "ffa3" | "2v2">("1v1");
-  const [stake, setStake] = useState(0);
+  const [stake, setStake] = useState<number>(0);
   const [selectedSeason, setSelectedSeason] = useState<string>("");
 
   useEffect(() => {
-    fetchLobbies();
-    fetchSeasons();
+    refreshAll();
 
-    const channel = supabase
+    const ch = supabase
       .channel("lobbies-changes")
-      .on("postgres_changes", { event: "*", schema: "public", table: "lobbies" }, () => {
-        fetchLobbies();
-      })
-      .on("postgres_changes", { event: "*", schema: "public", table: "lobby_players" }, () => {
-        fetchLobbies();
-      })
+      .on("postgres_changes", { event: "*", schema: "public", table: "lobbies" }, refreshAll)
+      .on("postgres_changes", { event: "*", schema: "public", table: "lobby_players" }, refreshAll)
       .subscribe();
 
     return () => {
-      supabase.removeChannel(channel);
+      supabase.removeChannel(ch);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const refreshAll = async () => {
+    await Promise.all([fetchLobbies(), fetchSeasons()]);
+  };
+
   async function fetchLobbies() {
-    try {
-      const { data: lobbiesData, error } = await supabase
-        .from("lobbies")
-        .select("*")
-        .eq("status", "waiting")
-        .order("created_at", { ascending: false });
+    // 1) get open lobbies
+    const { data: lob, error } = await supabase
+      .from("lobbies")
+      .select("id, code, mode, stake_amount, status, max_players, host_id, season_id")
+      .eq("status", "waiting")
+      .order("created_at", { ascending: false });
 
-      if (error) {
-        console.error("Failed to fetch lobbies:", error);
-        setLobbies([]);
-        return;
-      }
-
-      if (!lobbiesData) {
-        setLobbies([]);
-        return;
-      }
-
-      const lobbiesWithPlayers = await Promise.all(
-        lobbiesData.map(async (lobby) => {
-          const { data: playersData } = await supabase
-            .from("lobby_players")
-            .select("user_id")
-            .eq("lobby_id", lobby.id);
-
-          return {
-            ...lobby,
-            players: playersData?.map((p: any) => ({
-              user_id: p.user_id,
-              username: "Player",
-            })) || [],
-          };
-        })
-      );
-
-      setLobbies(lobbiesWithPlayers);
-    } catch (err) {
-      console.error("Error fetching lobbies:", err);
+    if (error) {
+      console.error("fetch lobbies:", error);
       setLobbies([]);
+      return;
     }
+    const lobbiesData = (lob ?? []) as LobbyRow[];
+    if (!lobbiesData.length) {
+      setLobbies([]);
+      return;
+    }
+
+    // 2) players for these lobbies (batched; avoid N+1)
+    const lobbyIds = lobbiesData.map((l) => l.id);
+    const { data: playersRows, error: lpErr } = await supabase
+      .from("lobby_players")
+      .select("lobby_id, user_id")
+      .in("lobby_id", lobbyIds);
+
+    if (lpErr) {
+      console.error("fetch lobby_players:", lpErr);
+      setLobbies(lobbiesData.map((l) => ({ ...l, players: [] })));
+      return;
+    }
+
+    const userIds = Array.from(new Set((playersRows ?? []).map((r) => r.user_id)));
+    let usernames = new Map<string, string>();
+    if (userIds.length) {
+      const { data: profs } = await supabase.from("profiles").select("user_id, username").in("user_id", userIds);
+      (profs ?? []).forEach((p) => usernames.set(p.user_id, p.username ?? "Player"));
+    }
+
+    const playersByLobby = new Map<string, { user_id: string; username: string }[]>();
+    (playersRows ?? []).forEach((r) => {
+      const arr = playersByLobby.get(r.lobby_id) ?? [];
+      arr.push({ user_id: r.user_id, username: usernames.get(r.user_id) ?? "Player" });
+      playersByLobby.set(r.lobby_id, arr);
+    });
+
+    const ui: LobbyUI[] = lobbiesData.map((l) => ({
+      ...l,
+      players: playersByLobby.get(l.id) ?? [],
+    }));
+    setLobbies(ui);
   }
 
   async function fetchSeasons() {
-    const { data } = await supabase.from("seasons").select("id, name").order("created_at", { ascending: false });
-    if (data) setSeasons(data);
+    // if created_at doesn’t exist, order by name
+    const { data, error } = await supabase.from("seasons").select("id, name").order("name", { ascending: true });
+    if (!error && data) setSeasons(data);
+  }
+
+  const maxPlayersForMode = useMemo(
+    () => (m: "1v1" | "ffa3" | "2v2") => {
+      if (m === "1v1") return 2;
+      if (m === "ffa3") return 3;
+      return 4; // 2v2
+    },
+    [],
+  );
+
+  function newLobbyCode(): string {
+    // 6-char uppercase alnum
+    const base = Math.random().toString(36).slice(2, 8).toUpperCase();
+    return base.replace(/[^A-Z0-9]/g, "A").padEnd(6, "A");
   }
 
   async function createLobby() {
@@ -111,24 +137,55 @@ export default function Lobbies() {
       toast({ title: "Please log in first", variant: "destructive" });
       return;
     }
+    if (stake < 0) {
+      toast({ title: "Invalid stake", description: "Stake must be ≥ 0", variant: "destructive" });
+      return;
+    }
 
-    const code = Math.random().toString(36).substring(2, 8).toUpperCase();
-    
-    const { error } = await supabase.from("lobbies").insert({
-      code,
-      mode,
-      stake_amount: stake,
-      host_id: user.id,
-      season_id: selectedSeason || null,
+    const code = newLobbyCode();
+    const maxPlayers = maxPlayersForMode(mode);
+
+    // Insert lobby; RLS policy must allow host to insert (see SQL below)
+    const { data: lobbyInsert, error: lobErr } = await supabase
+      .from("lobbies")
+      .insert({
+        code,
+        mode,
+        stake_amount: stake,
+        host_id: user.id,
+        season_id: selectedSeason || null,
+        max_players: maxPlayers,
+        status: "waiting",
+      })
+      .select("id")
+      .single();
+
+    if (lobErr || !lobbyInsert) {
+      toast({
+        title: "Failed to create lobby",
+        description: lobErr?.message ?? "Unknown error",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    // Ensure HOST is in lobby_players (in case DB trigger is not present)
+    const { error: lpErr } = await supabase.from("lobby_players").insert({
+      lobby_id: lobbyInsert.id,
+      user_id: user.id,
+      order_no: 1,
+      team: mode === "2v2" ? "A" : null,
     });
 
-    if (error) {
-      toast({ title: "Failed to create lobby", description: error.message, variant: "destructive" });
-    } else {
-      toast({ title: "Lobby created", description: `Share code: ${code}` });
-      setStake(0);
-      fetchLobbies();
+    if (lpErr) {
+      toast({ title: "Lobby created but join failed", description: lpErr.message, variant: "destructive" });
+      return;
     }
+
+    toast({ title: "Lobby created", description: `Share code: ${code}` });
+    setStake(0);
+    setSelectedSeason("");
+    fetchLobbies();
   }
 
   async function joinLobby() {
@@ -138,12 +195,15 @@ export default function Lobbies() {
     }
 
     const code = joinCode.trim().toUpperCase();
-    if (!code) return;
+    if (!/^[A-Z0-9]{6}$/.test(code)) {
+      toast({ title: "Invalid code", description: "Use a 6-character code (A–Z, 0–9)", variant: "destructive" });
+      return;
+    }
 
     const { error } = await supabase.rpc("join_lobby_by_code", { p_code: code });
 
     if (error) {
-      const msg = error.message;
+      const msg = error.message ?? "Join failed";
       if (msg.includes("UNAUTHENTICATED")) {
         toast({ title: "Please log in first", variant: "destructive" });
       } else if (msg.includes("LOBBY_NOT_FOUND")) {
@@ -169,13 +229,15 @@ export default function Lobbies() {
       toast({ title: "Only host can start", variant: "destructive" });
       return;
     }
-
     const { data, error } = await supabase.rpc("start_game", { p_lobby_id: lobbyId });
-
     if (error) {
-      const msg = error.message;
+      const msg = error.message ?? "Start failed";
       if (msg.includes("INSUFFICIENT_FUNDS")) {
-        toast({ title: "Insufficient funds", description: "Not enough balance to cover the stake.", variant: "destructive" });
+        toast({
+          title: "Insufficient funds",
+          description: "Not enough balance to cover the stake.",
+          variant: "destructive",
+        });
       } else {
         toast({ title: "Start failed", description: msg, variant: "destructive" });
       }
@@ -195,7 +257,7 @@ export default function Lobbies() {
           <CardContent className="space-y-4">
             <div className="space-y-2">
               <Label>Mode</Label>
-              <Select value={mode} onValueChange={(v: any) => setMode(v)}>
+              <Select value={mode} onValueChange={(v: "1v1" | "ffa3" | "2v2") => setMode(v)}>
                 <SelectTrigger>
                   <SelectValue />
                 </SelectTrigger>
@@ -213,7 +275,7 @@ export default function Lobbies() {
                 min="0"
                 step="0.01"
                 value={stake}
-                onChange={(e) => setStake(Number(e.target.value))}
+                onChange={(e) => setStake(Number(e.target.value || 0))}
               />
             </div>
             {seasons.length > 0 && (
@@ -224,6 +286,7 @@ export default function Lobbies() {
                     <SelectValue placeholder="None" />
                   </SelectTrigger>
                   <SelectContent>
+                    <SelectItem value="">None</SelectItem>
                     {seasons.map((s) => (
                       <SelectItem key={s.id} value={s.id}>
                         {s.name}
@@ -250,7 +313,7 @@ export default function Lobbies() {
               <Input
                 placeholder="ABC123"
                 value={joinCode}
-                onChange={(e) => setJoinCode(e.target.value.toUpperCase())}
+                onChange={(e) => setJoinCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ""))}
                 maxLength={6}
               />
             </div>
@@ -271,19 +334,16 @@ export default function Lobbies() {
           ) : (
             <div className="space-y-3">
               {lobbies.map((lobby) => (
-                <div
-                  key={lobby.id}
-                  className="flex items-center justify-between rounded-lg border border-border bg-card p-4"
-                >
+                <div key={lobby.id} className="flex items-center justify-between rounded-lg border bg-card p-4">
                   <div>
                     <div className="font-semibold">
-                      {lobby.code} - {lobby.mode.toUpperCase()}
+                      {lobby.code} — {lobby.mode.toUpperCase()}
                     </div>
                     <div className="text-sm text-muted-foreground">
                       Stake: {lobby.stake_amount} | Players: {lobby.players.length}/{lobby.max_players}
                     </div>
-                    <div className="text-xs text-muted-foreground">
-                      {lobby.players.map((p) => p.username).join(", ")}
+                    <div className="text-xs text-muted-foreground truncate max-w-[60ch]">
+                      {lobby.players.map((p) => p.username || p.user_id.slice(0, 6)).join(", ")}
                     </div>
                   </div>
                   {user?.id === lobby.host_id && (
