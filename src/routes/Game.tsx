@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo, useCallback } from "react";
 import { useParams } from "react-router-dom";
 import { supabase } from "@/lib/supabaseClient";
 import { useMe } from "@/hooks/useMe";
@@ -18,27 +18,20 @@ type Round = {
   turn_deadline: string | null;
 };
 
-type PlayerCard = {
-  card: string;
-};
-
 type GamePlayer = {
   user_id: string;
   order_no: number;
   team: string | null;
   finished_at: string | null;
   finish_rank: number | null;
-  username: string;
+  username?: string;
 };
 
-type OpponentHand = {
-  user_id: string;
-  count: number;
-};
+type OpponentHand = { user_id: string; count: number };
 
-type Game = {
+type GameRow = {
   id: string;
-  mode: string;
+  mode: "1v1" | "ffa3" | "2v2";
   stake: number;
   status: string;
   season_id: string | null;
@@ -53,199 +46,189 @@ type Scoreboard = {
 };
 
 export default function Game() {
-  const { id } = useParams<{ id: string }>();
+  const { id: gameId } = useParams<{ id: string }>();
   const { user } = useMe();
 
   const [round, setRound] = useState<Round | null>(null);
   const [myCards, setMyCards] = useState<string[]>([]);
   const [players, setPlayers] = useState<GamePlayer[]>([]);
   const [opponents, setOpponents] = useState<OpponentHand[]>([]);
-  const [game, setGame] = useState<Game | null>(null);
+  const [game, setGame] = useState<GameRow | null>(null);
   const [scoreboard, setScoreboard] = useState<Scoreboard | null>(null);
-
   const [selected, setSelected] = useState<string[]>([]);
   const [timeLeft, setTimeLeft] = useState<number>(0);
 
+  // ---------- fetchers ----------
+  const fetchMyCards = useCallback(async () => {
+    if (!gameId || !user?.id) return;
+    const { data, error } = await supabase
+      .from("player_cards")
+      .select("card")
+      .eq("game_id", gameId)
+      .eq("user_id", user.id)
+      .order("card");
+    if (error) {
+      console.error("player_cards:", error.message);
+      return;
+    }
+    setMyCards((data ?? []).map((c: any) => (c.card as string).toUpperCase()));
+  }, [gameId, user?.id]);
+
+  const fetchOpponents = useCallback(async () => {
+    if (!gameId) return;
+    const { data, error } = await supabase.from("opponent_hands").select("*").eq("game_id", gameId);
+    if (!error && data) setOpponents(data as OpponentHand[]);
+  }, [gameId]);
+
+  const fetchScoreboard = useCallback(async (seasonId: string) => {
+    const { data, error } = await supabase.rpc("season_scoreboard", {
+      p_season: seasonId,
+    });
+    if (!error && data) setScoreboard(data as Scoreboard);
+  }, []);
+
+  const fetchInitial = useCallback(async () => {
+    if (!gameId || !user?.id) return;
+
+    const [r, gp, g] = await Promise.all([
+      supabase.from("rounds").select("*").eq("game_id", gameId).maybeSingle(),
+      supabase
+        .from("game_players")
+        .select("user_id, order_no, team, finished_at, finish_rank")
+        .eq("game_id", gameId)
+        .order("order_no"),
+      supabase.from("games").select("*").eq("id", gameId).maybeSingle(),
+    ]);
+
+    if (r.data) setRound(r.data as Round);
+    if (g.data) {
+      const row = g.data as GameRow;
+      setGame(row);
+      if (row.season_id) fetchScoreboard(row.season_id);
+    }
+
+    // batch load usernames for game players
+    if (gp.data) {
+      const base = gp.data as GamePlayer[];
+      const ids = Array.from(new Set(base.map((p) => p.user_id)));
+      let nameMap = new Map<string, string>();
+      if (ids.length) {
+        const { data: profs } = await supabase.from("profiles").select("user_id, username").in("user_id", ids);
+        (profs ?? []).forEach((p: any) => nameMap.set(p.user_id, p.username ?? "Player"));
+      }
+      setPlayers(base.map((p) => ({ ...p, username: nameMap.get(p.user_id) })));
+    }
+
+    await Promise.all([fetchMyCards(), fetchOpponents()]);
+  }, [gameId, user?.id, fetchMyCards, fetchOpponents, fetchScoreboard]);
+
+  // ---------- effects ----------
   useEffect(() => {
-    if (!id || !user) return;
+    if (!gameId || !user?.id) return;
+    fetchInitial();
 
-    fetchInitialData();
-
-    const channel = supabase
-      .channel(`game-${id}`)
+    // subscribe AFTER user id is known, and filter to my cards only
+    const ch = supabase
+      .channel(`game-${gameId}`)
       .on(
         "postgres_changes",
-        { event: "UPDATE", schema: "public", table: "rounds", filter: `game_id=eq.${id}` },
-        (payload) => {
-          setRound(payload.new as Round);
-        }
+        { event: "UPDATE", schema: "public", table: "rounds", filter: `game_id=eq.${gameId}` },
+        (payload) => setRound(payload.new as Round),
       )
       .on(
         "postgres_changes",
-        { event: "*", schema: "public", table: "player_cards", filter: `game_id=eq.${id}` },
-        () => {
-          fetchMyCards();
-        }
+        {
+          event: "*",
+          schema: "public",
+          table: "player_cards",
+          filter: `game_id=eq.${gameId},user_id=eq.${user.id}`,
+        },
+        () => fetchMyCards(),
       )
       .subscribe();
 
-    const pollInterval = setInterval(() => {
-      fetchOpponents();
-    }, 3000);
+    const poll = setInterval(fetchOpponents, 3000);
 
     return () => {
-      supabase.removeChannel(channel);
-      clearInterval(pollInterval);
+      supabase.removeChannel(ch);
+      clearInterval(poll);
     };
-  }, [id, user]);
+  }, [gameId, user?.id, fetchInitial, fetchMyCards, fetchOpponents]);
 
+  // countdown
   useEffect(() => {
     if (!round?.turn_deadline) {
       setTimeLeft(0);
       return;
     }
-
     const deadline = new Date(round.turn_deadline).getTime();
-    const interval = setInterval(() => {
+    const i = setInterval(() => {
       const now = Date.now();
-      const diff = Math.max(0, Math.floor((deadline - now) / 1000));
-      setTimeLeft(diff);
+      setTimeLeft(Math.max(0, Math.floor((deadline - now) / 1000)));
     }, 1000);
-
-    return () => clearInterval(interval);
+    return () => clearInterval(i);
   }, [round?.turn_deadline]);
 
-  async function fetchInitialData() {
-    if (!id || !user) return;
-
-    const [roundRes, playersRes, cardsRes, opponentsRes, gameRes] = await Promise.all([
-      supabase.from("rounds").select("*").eq("game_id", id).single(),
-      supabase.from("game_players").select("*").eq("game_id", id).order("order_no"),
-      supabase.from("player_cards").select("card").eq("game_id", id).eq("user_id", user.id),
-      supabase.from("opponent_hands").select("*").eq("game_id", id),
-      supabase.from("games").select("*").eq("id", id).single(),
-    ]);
-
-    if (roundRes.data) setRound(roundRes.data);
-    if (playersRes.data) {
-      const playersWithNames = await Promise.all(
-        playersRes.data.map(async (p) => {
-          const { data: profile } = await supabase
-            .from("profiles")
-            .select("username")
-            .eq("user_id", p.user_id)
-            .single();
-          return { ...p, username: profile?.username || "Unknown" };
-        })
-      );
-      setPlayers(playersWithNames);
-    }
-    if (cardsRes.data) setMyCards(cardsRes.data.map((c) => c.card));
-    if (opponentsRes.data) setOpponents(opponentsRes.data);
-    if (gameRes.data) {
-      setGame(gameRes.data);
-      if (gameRes.data.season_id) {
-        fetchScoreboard(gameRes.data.season_id);
-      }
-    }
-  }
-
-  async function fetchMyCards() {
-    if (!id || !user) return;
-    const { data } = await supabase
-      .from("player_cards")
-      .select("card")
-      .eq("game_id", id)
-      .eq("user_id", user.id);
-    if (data) setMyCards(data.map((c) => c.card));
-  }
-
-  async function fetchOpponents() {
-    if (!id) return;
-    const { data } = await supabase.from("opponent_hands").select("*").eq("game_id", id);
-    if (data) setOpponents(data);
-  }
-
-  async function fetchScoreboard(seasonId: string) {
-    const { data } = await supabase.rpc("season_scoreboard", { p_season: seasonId });
-    if (data) setScoreboard(data);
-  }
-
+  // ---------- actions ----------
   async function playMove() {
-    if (!id || !user || selected.length === 0) return;
-
-    const reqId = uuidv4();
+    if (!gameId || !user?.id || selected.length === 0) return;
     const { error } = await supabase.rpc("play_move", {
-      p_game_id: id,
+      p_game_id: gameId,
       p_cards: selected,
-      p_request_id: reqId,
+      p_request_id: uuidv4(),
     });
-
-    if (error) {
-      handleGameError(error.message);
-    } else {
-      setSelected([]);
-    }
+    if (error) handleGameError(error.message);
+    else setSelected([]);
   }
 
   async function passTurn() {
-    if (!id || !user) return;
-
-    const reqId = uuidv4();
+    if (!gameId || !user?.id) return;
     const { error } = await supabase.rpc("pass_turn", {
-      p_game_id: id,
-      p_request_id: reqId,
+      p_game_id: gameId,
+      p_request_id: uuidv4(),
     });
-
-    if (error) {
-      handleGameError(error.message);
-    }
+    if (error) handleGameError(error.message);
   }
 
   function handleGameError(msg: string) {
-    if (msg.includes("EMPTY_PLAY")) {
-      toast({ title: "Select cards to play", variant: "destructive" });
-    } else if (msg.includes("CARD_NOT_OWNED")) {
-      toast({ title: "You don't own those cards", variant: "destructive" });
-    } else if (msg.includes("FIRST_PLAY_MUST_INCLUDE_3S")) {
-      toast({ title: "First play must include 3♠", variant: "destructive" });
-    } else if (msg.includes("INVALID_COMBINATION")) {
-      toast({ title: "Invalid combination", variant: "destructive" });
-    } else if (msg.includes("DOES_NOT_BEAT_LAST")) {
-      toast({ title: "Must beat last play", variant: "destructive" });
-    } else if (msg.includes("TURN_NOT_YOURS")) {
-      toast({ title: "Not your turn", variant: "destructive" });
-    } else if (msg.includes("DEADLINE_EXCEEDED")) {
-      toast({ title: "Turn deadline exceeded", variant: "destructive" });
-    } else {
-      toast({ title: "Error", description: msg, variant: "destructive" });
-    }
+    const map: Record<string, string> = {
+      EMPTY_PLAY: "Select cards to play",
+      CARD_NOT_OWNED: "You don't own those cards",
+      FIRST_PLAY_MUST_INCLUDE_3S: "First play must include 3♠",
+      INVALID_COMBINATION: "Invalid combination",
+      DOES_NOT_BEAT_LAST: "Must beat last play",
+      TURN_NOT_YOURS: "Not your turn",
+      DEADLINE_EXCEEDED: "Turn deadline exceeded",
+      UNAUTHENTICATED: "Please log in again",
+    };
+    const key = Object.keys(map).find((k) => msg.includes(k));
+    toast({
+      title: key ? map[key] : "Error",
+      description: key ? undefined : msg,
+      variant: "destructive",
+    });
   }
 
-  function toggleCard(card: string) {
-    setSelected((prev) =>
-      prev.includes(card) ? prev.filter((c) => c !== card) : [...prev, card]
-    );
+  function toggleCard(code: string) {
+    const card = code.toUpperCase();
+    setSelected((prev) => (prev.includes(card) ? prev.filter((c) => c !== card) : [...prev, card]));
   }
 
-  const isMyTurn = round?.current_turn === user?.id;
+  const isMyTurn = round?.current_turn && user?.id && round.current_turn === user.id;
 
+  // ---------- render ----------
   return (
     <div className="flex h-[calc(100vh-64px)] flex-col bg-table p-4">
       <div className="mb-4 flex items-center justify-between rounded-lg bg-card p-4 text-sm">
         <div>
-          Game: {id?.slice(0, 8)} | Mode: {game?.mode.toUpperCase()} | Stake: {game?.stake}
+          Game: {gameId?.slice(0, 8)} | Mode: {game?.mode.toUpperCase()} | Stake: {game?.stake}
         </div>
-        {round?.turn_deadline && (
-          <div className="font-semibold">
-            ⏱️ {timeLeft}s
-          </div>
-        )}
+        <div className="font-semibold">{round?.turn_deadline ? `⏱️ ${timeLeft}s` : "—"}</div>
       </div>
 
       {scoreboard && (
         <Card className="mb-4 p-4">
-          <div className="text-sm font-semibold mb-2">Season Scoreboard (Target: {scoreboard.target})</div>
+          <div className="mb-2 text-sm font-semibold">Season Scoreboard (Target: {scoreboard.target})</div>
           {scoreboard.mode === "2v2" && scoreboard.teamA && scoreboard.teamB ? (
             <div className="flex gap-4 text-sm">
               <div>Team A: {scoreboard.teamA.points}</div>
@@ -263,19 +246,17 @@ export default function Game() {
         </Card>
       )}
 
+      {/* Opponents */}
       <div className="mb-4 flex flex-wrap gap-3">
         {players
           .filter((p) => p.user_id !== user?.id)
           .map((p) => {
             const hand = opponents.find((o) => o.user_id === p.user_id);
             return (
-              <div
-                key={p.user_id}
-                className="rounded-lg bg-card p-3 text-sm"
-              >
-                <div className="font-semibold">{p.username}</div>
+              <div key={p.user_id} className="rounded-lg bg-card p-3 text-sm">
+                <div className="font-semibold">{p.username ?? p.user_id.slice(0, 6)}</div>
                 <div className="text-muted-foreground">
-                  Cards: {hand?.count || 0}
+                  Cards: {hand?.count ?? 0}
                   {p.finished_at && " (Finished)"}
                 </div>
               </div>
@@ -283,51 +264,50 @@ export default function Game() {
           })}
       </div>
 
+      {/* Last play */}
       <div className="mb-4 flex min-h-[120px] items-center justify-center rounded-lg bg-felt p-4">
-        {round?.last_play?.combo?.cards ? (
+        {round?.last_play?.combo?.cards?.length ? (
           <div className="flex gap-2">
-            {round.last_play.combo.cards.map((card: string, i: number) => (
-              <img
-                key={i}
-                src={`/cards/${card}.png`}
-                alt={card}
-                className="h-24 w-auto rounded shadow-lg"
-              />
-            ))}
+            {round.last_play.combo.cards.map((c: string, i: number) => {
+              const code = c.toUpperCase();
+              return (
+                <img
+                  key={`${code}-${i}`}
+                  src={`/cards/${code}.png`}
+                  alt={code}
+                  className="h-24 w-auto rounded shadow-lg"
+                />
+              );
+            })}
           </div>
         ) : (
           <div className="text-muted-foreground">No plays yet</div>
         )}
       </div>
 
+      {/* My hand */}
       <div className="mb-4 flex flex-wrap justify-center gap-2">
-        {myCards.map((card) => (
-          <img
-            key={card}
-            src={`/cards/${card}.png`}
-            alt={card}
-            className={`h-28 w-auto cursor-pointer rounded shadow-md transition-transform ${
-              selected.includes(card) ? "-translate-y-4 ring-4 ring-primary" : "hover:-translate-y-2"
-            }`}
-            onClick={() => toggleCard(card)}
-          />
-        ))}
+        {myCards.map((code) => {
+          const up = code.toUpperCase();
+          const selectedCls = selected.includes(up) ? "-translate-y-4 ring-4 ring-primary" : "hover:-translate-y-2";
+          return (
+            <img
+              key={up}
+              src={`/cards/${up}.png`}
+              alt={up}
+              className={`h-28 w-auto cursor-pointer rounded shadow-md transition-transform ${selectedCls}`}
+              onClick={() => toggleCard(up)}
+            />
+          );
+        })}
       </div>
 
+      {/* Actions */}
       <div className="flex gap-3">
-        <Button
-          onClick={playMove}
-          disabled={!isMyTurn || selected.length === 0}
-          className="flex-1"
-        >
+        <Button onClick={playMove} disabled={!isMyTurn || selected.length === 0} className="flex-1">
           Play
         </Button>
-        <Button
-          onClick={passTurn}
-          disabled={!isMyTurn}
-          variant="secondary"
-          className="flex-1"
-        >
+        <Button onClick={passTurn} disabled={!isMyTurn} variant="secondary" className="flex-1">
           Pass
         </Button>
       </div>
