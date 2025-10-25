@@ -221,7 +221,7 @@ export default function Game() {
     <div className="flex h-[calc(100vh-64px)] flex-col bg-table p-4">
       <div className="mb-4 flex items-center justify-between rounded-lg bg-card p-4 text-sm">
         <div>
-          Game: {gameId?.slice(0, 8)} | Mode: {game?.mode.toUpperCase()} | Stake: {game?.stake_amount}
+          Game: {gameId?.slice(0, 8)} | Mode: {game?.mode.toUpperCase()} | Stake: {game?.stake}
         </div>
         <div className="font-semibold">{round?.turn_deadline ? `⏱️ ${timeLeft}s` : "—"}</div>
       </div>
