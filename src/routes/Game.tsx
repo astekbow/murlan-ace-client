@@ -60,7 +60,7 @@ export default function Game() {
 
   // ---------- fetchers ----------
   const fetchMyCards = useCallback(async () => {
-    if (!gameId || !user?.id) return;
+    if (!gameId || !user?.id || user.id === "null") return;
     const { data, error } = await supabase
       .from("player_cards")
       .select("card")
@@ -88,7 +88,7 @@ export default function Game() {
   }, []);
 
   const fetchInitial = useCallback(async () => {
-    if (!gameId || !user?.id) return;
+    if (!gameId || !user?.id || user.id === "null") return;
 
     const [r, gp, g] = await Promise.all([
       supabase.from("rounds").select("*").eq("game_id", gameId).maybeSingle(),
@@ -124,7 +124,7 @@ export default function Game() {
 
   // ---------- effects ----------
   useEffect(() => {
-    if (!gameId || !user?.id) return;
+    if (!gameId || !user?.id || user.id === "null") return;
     fetchInitial();
 
     // subscribe AFTER user id is known, and filter to my cards only
@@ -171,7 +171,7 @@ export default function Game() {
 
   // ---------- actions ----------
   async function playMove() {
-    if (!gameId || !user?.id || selected.length === 0) return;
+    if (!gameId || !user?.id || user.id === "null" || selected.length === 0) return;
     const { error } = await supabase.rpc("play_move", {
       p_game_id: gameId,
       p_cards: selected,
@@ -182,7 +182,7 @@ export default function Game() {
   }
 
   async function passTurn() {
-    if (!gameId || !user?.id) return;
+    if (!gameId || !user?.id || user.id === "null") return;
     const { error } = await supabase.rpc("pass_turn", {
       p_game_id: gameId,
       p_request_id: uuidv4(),
@@ -221,7 +221,7 @@ export default function Game() {
     <div className="flex h-[calc(100vh-64px)] flex-col bg-table p-4">
       <div className="mb-4 flex items-center justify-between rounded-lg bg-card p-4 text-sm">
         <div>
-          Game: {gameId?.slice(0, 8)} | Mode: {game?.mode.toUpperCase()} | Stake: {game?.stake}
+          Game: {gameId?.slice(0, 8)} | Mode: {game?.mode.toUpperCase()} | Stake: {game?.stake_amount}
         </div>
         <div className="font-semibold">{round?.turn_deadline ? `⏱️ ${timeLeft}s` : "—"}</div>
       </div>
