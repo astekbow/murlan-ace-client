@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useMemo, useCallback } from "react";
 import { useParams } from "react-router-dom";
 import { supabase } from "@/lib/supabaseClient";
 import { useMe } from "@/hooks/useMe";
@@ -32,7 +32,7 @@ type OpponentHand = { user_id: string; count: number };
 type GameRow = {
   id: string;
   mode: "1v1" | "ffa3" | "2v2";
-  stake: number;
+  stake_amount: number;
   status: string;
   season_id: string | null;
 };
@@ -45,12 +45,8 @@ type Scoreboard = {
   leaders?: { user_id: string; points: number }[];
 };
 
-const isUuid = (v?: string | null) =>
-  !!v && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v);
-
 export default function Game() {
-  const { id } = useParams<{ id: string }>();
-  const safeGameId = isUuid(id) ? id! : null;
+  const { id: gameId } = useParams<{ id: string }>();
   const { user } = useMe();
 
   const [round, setRound] = useState<Round | null>(null);
@@ -64,11 +60,11 @@ export default function Game() {
 
   // ---------- fetchers ----------
   const fetchMyCards = useCallback(async () => {
-    if (!safeGameId || !user?.id) return;
+    if (!gameId || !user?.id) return;
     const { data, error } = await supabase
       .from("player_cards")
       .select("card")
-      .eq("game_id", safeGameId)
+      .eq("game_id", gameId)
       .eq("user_id", user.id)
       .order("card");
     if (error) {
@@ -76,13 +72,13 @@ export default function Game() {
       return;
     }
     setMyCards((data ?? []).map((c: any) => (c.card as string).toUpperCase()));
-  }, [safeGameId, user?.id]);
+  }, [gameId, user?.id]);
 
   const fetchOpponents = useCallback(async () => {
-    if (!safeGameId) return;
-    const { data, error } = await supabase.from("opponent_hands").select("*").eq("game_id", safeGameId);
+    if (!gameId) return;
+    const { data, error } = await supabase.from("opponent_hands").select("*").eq("game_id", gameId);
     if (!error && data) setOpponents(data as OpponentHand[]);
-  }, [safeGameId]);
+  }, [gameId]);
 
   const fetchScoreboard = useCallback(async (seasonId: string) => {
     const { data, error } = await supabase.rpc("season_scoreboard", {
@@ -92,26 +88,26 @@ export default function Game() {
   }, []);
 
   const fetchInitial = useCallback(async () => {
-    if (!safeGameId || !user?.id) return;
+    if (!gameId || !user?.id) return;
 
     const [r, gp, g] = await Promise.all([
-      supabase.from("rounds").select("*").eq("game_id", safeGameId).maybeSingle(),
+      supabase.from("rounds").select("*").eq("game_id", gameId).maybeSingle(),
       supabase
         .from("game_players")
         .select("user_id, order_no, team, finished_at, finish_rank")
-        .eq("game_id", safeGameId)
+        .eq("game_id", gameId)
         .order("order_no"),
-      supabase.from("games").select("*").eq("id", safeGameId).maybeSingle(),
+      supabase.from("games").select("*").eq("id", gameId).maybeSingle(),
     ]);
 
     if (r.data) setRound(r.data as Round);
-
     if (g.data) {
       const row = g.data as GameRow;
       setGame(row);
       if (row.season_id) fetchScoreboard(row.season_id);
     }
 
+    // batch load usernames for game players
     if (gp.data) {
       const base = gp.data as GamePlayer[];
       const ids = Array.from(new Set(base.map((p) => p.user_id)));
@@ -124,24 +120,19 @@ export default function Game() {
     }
 
     await Promise.all([fetchMyCards(), fetchOpponents()]);
-  }, [safeGameId, user?.id, fetchMyCards, fetchOpponents, fetchScoreboard]);
+  }, [gameId, user?.id, fetchMyCards, fetchOpponents, fetchScoreboard]);
 
   // ---------- effects ----------
   useEffect(() => {
-    if (!safeGameId || !user?.id) return;
+    if (!gameId || !user?.id) return;
     fetchInitial();
 
     // subscribe AFTER user id is known, and filter to my cards only
     const ch = supabase
-      .channel(`game-${safeGameId}`)
+      .channel(`game-${gameId}`)
       .on(
         "postgres_changes",
-        {
-          event: "UPDATE",
-          schema: "public",
-          table: "rounds",
-          filter: `game_id=eq.${safeGameId}`,
-        },
+        { event: "UPDATE", schema: "public", table: "rounds", filter: `game_id=eq.${gameId}` },
         (payload) => setRound(payload.new as Round),
       )
       .on(
@@ -150,7 +141,7 @@ export default function Game() {
           event: "*",
           schema: "public",
           table: "player_cards",
-          filter: `game_id=eq.${safeGameId},user_id=eq.${user.id}`,
+          filter: `game_id=eq.${gameId},user_id=eq.${user.id}`,
         },
         () => fetchMyCards(),
       )
@@ -162,7 +153,7 @@ export default function Game() {
       supabase.removeChannel(ch);
       clearInterval(poll);
     };
-  }, [safeGameId, user?.id, fetchInitial, fetchMyCards, fetchOpponents]);
+  }, [gameId, user?.id, fetchInitial, fetchMyCards, fetchOpponents]);
 
   // countdown
   useEffect(() => {
@@ -180,9 +171,9 @@ export default function Game() {
 
   // ---------- actions ----------
   async function playMove() {
-    if (!safeGameId || !user?.id || selected.length === 0) return;
+    if (!gameId || !user?.id || selected.length === 0) return;
     const { error } = await supabase.rpc("play_move", {
-      p_game_id: safeGameId,
+      p_game_id: gameId,
       p_cards: selected,
       p_request_id: uuidv4(),
     });
@@ -191,9 +182,9 @@ export default function Game() {
   }
 
   async function passTurn() {
-    if (!safeGameId || !user?.id) return;
+    if (!gameId || !user?.id) return;
     const { error } = await supabase.rpc("pass_turn", {
-      p_game_id: safeGameId,
+      p_game_id: gameId,
       p_request_id: uuidv4(),
     });
     if (error) handleGameError(error.message);
@@ -219,8 +210,8 @@ export default function Game() {
   }
 
   function toggleCard(code: string) {
-    const up = (code || "").toUpperCase();
-    setSelected((prev) => (prev.includes(up) ? prev.filter((c) => c !== up) : [...prev, up]));
+    const card = code.toUpperCase();
+    setSelected((prev) => (prev.includes(card) ? prev.filter((c) => c !== card) : [...prev, card]));
   }
 
   const isMyTurn = round?.current_turn && user?.id && round.current_turn === user.id;
@@ -230,8 +221,7 @@ export default function Game() {
     <div className="flex h-[calc(100vh-64px)] flex-col bg-table p-4">
       <div className="mb-4 flex items-center justify-between rounded-lg bg-card p-4 text-sm">
         <div>
-          Game: {safeGameId ? safeGameId.slice(0, 8) : "—"} | Mode: {game?.mode?.toUpperCase() ?? "—"} | Stake:{" "}
-          {game?.stake ?? "—"}
+          Game: {gameId?.slice(0, 8)} | Mode: {game?.mode.toUpperCase()} | Stake: {game?.stake_amount}
         </div>
         <div className="font-semibold">{round?.turn_deadline ? `⏱️ ${timeLeft}s` : "—"}</div>
       </div>
@@ -279,14 +269,11 @@ export default function Game() {
         {round?.last_play?.combo?.cards?.length ? (
           <div className="flex gap-2">
             {round.last_play.combo.cards.map((c: string, i: number) => {
-              const code = (c || "").toUpperCase();
+              const code = c.toUpperCase();
               return (
                 <img
                   key={`${code}-${i}`}
                   src={`/cards/${code}.png`}
-                  onError={(e) => {
-                    (e.currentTarget as HTMLImageElement).src = "/cards/BACK.png";
-                  }}
                   alt={code}
                   className="h-24 w-auto rounded shadow-lg"
                 />
@@ -301,15 +288,12 @@ export default function Game() {
       {/* My hand */}
       <div className="mb-4 flex flex-wrap justify-center gap-2">
         {myCards.map((code) => {
-          const up = (code || "").toUpperCase();
+          const up = code.toUpperCase();
           const selectedCls = selected.includes(up) ? "-translate-y-4 ring-4 ring-primary" : "hover:-translate-y-2";
           return (
             <img
               key={up}
               src={`/cards/${up}.png`}
-              onError={(e) => {
-                (e.currentTarget as HTMLImageElement).src = "/cards/BACK.png";
-              }}
               alt={up}
               className={`h-28 w-auto cursor-pointer rounded shadow-md transition-transform ${selectedCls}`}
               onClick={() => toggleCard(up)}
