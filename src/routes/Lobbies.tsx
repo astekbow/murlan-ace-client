@@ -59,32 +59,46 @@ export default function Lobbies() {
   }, []);
 
   async function fetchLobbies() {
-    const { data: lobbiesData } = await supabase
-      .from("lobbies")
-      .select("*")
-      .eq("status", "waiting")
-      .order("created_at", { ascending: false });
+    try {
+      const { data: lobbiesData, error } = await supabase
+        .from("lobbies")
+        .select("*")
+        .eq("status", "waiting")
+        .order("created_at", { ascending: false });
 
-    if (!lobbiesData) return;
+      if (error) {
+        console.error("Failed to fetch lobbies:", error);
+        setLobbies([]);
+        return;
+      }
 
-    const lobbiesWithPlayers = await Promise.all(
-      lobbiesData.map(async (lobby) => {
-        const { data: playersData } = await supabase
-          .from("lobby_players")
-          .select("user_id, profiles(username)")
-          .eq("lobby_id", lobby.id);
+      if (!lobbiesData) {
+        setLobbies([]);
+        return;
+      }
 
-        return {
-          ...lobby,
-          players: playersData?.map((p: any) => ({
-            user_id: p.user_id,
-            username: p.profiles?.username || "Unknown",
-          })) || [],
-        };
-      })
-    );
+      const lobbiesWithPlayers = await Promise.all(
+        lobbiesData.map(async (lobby) => {
+          const { data: playersData } = await supabase
+            .from("lobby_players")
+            .select("user_id")
+            .eq("lobby_id", lobby.id);
 
-    setLobbies(lobbiesWithPlayers);
+          return {
+            ...lobby,
+            players: playersData?.map((p: any) => ({
+              user_id: p.user_id,
+              username: "Player",
+            })) || [],
+          };
+        })
+      );
+
+      setLobbies(lobbiesWithPlayers);
+    } catch (err) {
+      console.error("Error fetching lobbies:", err);
+      setLobbies([]);
+    }
   }
 
   async function fetchSeasons() {
@@ -202,22 +216,23 @@ export default function Lobbies() {
                 onChange={(e) => setStake(Number(e.target.value))}
               />
             </div>
-            <div className="space-y-2">
-              <Label>Season (optional)</Label>
-              <Select value={selectedSeason} onValueChange={setSelectedSeason}>
-                <SelectTrigger>
-                  <SelectValue placeholder="None" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="">None</SelectItem>
-                  {seasons.map((s) => (
-                    <SelectItem key={s.id} value={s.id}>
-                      {s.name}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
+            {seasons.length > 0 && (
+              <div className="space-y-2">
+                <Label>Season (optional)</Label>
+                <Select value={selectedSeason} onValueChange={setSelectedSeason}>
+                  <SelectTrigger>
+                    <SelectValue placeholder="None" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {seasons.map((s) => (
+                      <SelectItem key={s.id} value={s.id}>
+                        {s.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            )}
             <Button onClick={createLobby} className="w-full">
               Create Lobby
             </Button>

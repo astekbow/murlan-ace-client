@@ -69,7 +69,7 @@ export function useMe() {
   async function checkAdmin(userId: string) {
     try {
       const { data, error } = await supabase.rpc("is_admin", {
-        p_user_id: userId,
+        p_user: userId,
       });
       if (!error && data) {
         setIsAdmin(true);
